@@ -12,6 +12,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"regexp"
+	"strconv"
 	"os"
 	"path/filepath"
 	"strings"
@@ -196,6 +197,23 @@ func StartOAuthFlow(ctx context.Context, callbackHost string, callbackPort int, 
 			req.URL.Host = target.Host
 			req.Host = target.Host
 			req.Header.Del("Accept-Encoding")
+			// The browser carries redirect_uri=<callbackHost>/callback so that
+			// AH's client-side redirect lands on us. AH itself only accepts
+			// appie://login-exit, so map it back on every request we forward.
+			cb := callbackHost + "/callback"
+			req.URL.RawQuery = restoreAppieRedirect(req.URL.RawQuery, cb)
+			if ref := req.Header.Get("Referer"); ref != "" {
+				req.Header.Set("Referer", restoreAppieRedirect(ref, cb))
+			}
+			ct := req.Header.Get("Content-Type")
+			if req.Body != nil && (strings.Contains(ct, "json") || strings.Contains(ct, "x-www-form-urlencoded")) {
+				if raw, err := io.ReadAll(io.LimitReader(req.Body, 1<<20)); err == nil {
+					nb := []byte(restoreAppieRedirect(string(raw), cb))
+					req.Body = io.NopCloser(bytes.NewReader(nb))
+					req.ContentLength = int64(len(nb))
+					req.Header.Set("Content-Length", strconv.Itoa(len(nb)))
+				}
+			}
 			// Rewrite Origin and Referer so AH's API doesn't reject the request
 			// because it sees our proxy hostname instead of login.ah.nl.
 			if origin := req.Header.Get("Origin"); origin != "" {
@@ -220,8 +238,8 @@ func StartOAuthFlow(ctx context.Context, callbackHost string, callbackPort int, 
 
 	// Build the login URL that the user must open (via our local proxy).
 	loginURL = fmt.Sprintf(
-		"%s/login?client_id=%s&response_type=code&redirect_uri=appie://login-exit",
-		callbackHost, ahClientID,
+		"%s/login?client_id=%s&response_type=code&redirect_uri=%s",
+		callbackHost, ahClientID, url.QueryEscape(callbackHost+"/callback"),
 	)
 
 	// Wait for the code, exchange it, save tokens — all in background.
@@ -435,4 +453,16 @@ func logAppieContext(path string, body []byte) {
 		fmt.Fprintf(os.Stderr, "[ah-mcp] proxy %s: leftover appie context: %q\n", path, ctx)
 		logged++
 	}
+}
+
+// restoreAppieRedirect maps our callback URL (plain, JSON-escaped or
+// URL-encoded) back to the appie://login-exit redirect AH expects.
+func restoreAppieRedirect(in, cb string) string {
+	const appie = "appie://login-exit"
+	r := strings.NewReplacer(
+		cb, appie,
+		strings.ReplaceAll(cb, "/", `\/`), appie,
+		url.QueryEscape(cb), url.QueryEscape(appie),
+	)
+	return r.Replace(in)
 }
