@@ -374,6 +374,7 @@ func rewriteOAuthResponse(resp *http.Response, localOrigin, targetHost string) e
 	if err != nil {
 		return err
 	}
+	logPostLoginBody(resp, body)
 	cb := localOrigin + "/callback"
 	body = bytes.ReplaceAll(body, []byte("appie://login-exit"), []byte(cb))
 	// The Next.js post-login page can carry the redirect in escaped or
@@ -465,4 +466,27 @@ func restoreAppieRedirect(in, cb string) string {
 		url.QueryEscape(cb), url.QueryEscape(appie),
 	)
 	return r.Replace(in)
+}
+
+var codeParam = regexp.MustCompile(`code(=|%3D|":")[^&"\\]+`)
+
+// logPostLoginBody logs a masked prefix of the post-login API responses and
+// the names (never values) of any cookies they set, to see how AH hands the
+// auth code to the browser. Long tokens and code= values are masked.
+func logPostLoginBody(resp *http.Response, body []byte) {
+	path := resp.Request.URL.Path
+	if !strings.HasPrefix(path, "/login/api/login") && !strings.Contains(path, "ingelogd") {
+		return
+	}
+	n := len(body)
+	if n > 700 {
+		n = 700
+	}
+	m := codeParam.ReplaceAllString(string(body[:n]), "code=***")
+	m = longToken.ReplaceAllString(m, "***")
+	var names []string
+	for _, c := range resp.Header.Values("Set-Cookie") {
+		names = append(names, strings.SplitN(c, "=", 2)[0])
+	}
+	fmt.Fprintf(os.Stderr, "[ah-mcp] proxy %s: body(masked, %d bytes)=%q set-cookie-names=%v\n", path, len(body), m, names)
 }
