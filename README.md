@@ -320,3 +320,20 @@ Run `ah_login` first. In local mode the browser opens automatically; in remote m
 **ah-mcp** is built on top of [**appie-go**](https://github.com/gwillem/appie-go) — a Go client library for the Albert Heijn mobile API by [@gwillem](https://github.com/gwillem). It provides the authenticated HTTP client, all API call implementations (product search, bonus offers, orders, shopping lists, member profile, bargain items), and the OAuth token format. This project uses it as a library dependency without modification.
 
 The OAuth reverse-proxy login flow in `auth.go` is inspired by the approach in appie-go's `login.go`, adapted to return a URL string rather than open a browser — making it safe for server-side MCP use.
+
+## Deploying on Railway
+
+The repo ships a `Dockerfile`; Railway builds it automatically. Set these variables on the service and mount a volume on `/data`:
+
+| Variable | Value |
+|---|---|
+| `AH_REMOTE` | `true` |
+| `AH_MCP_PORT` / `PORT` | `3000` |
+| `AH_CALLBACK_PORT` | `9876` |
+| `AH_TOKENS_PATH` | `/data/tokens.json` (on the volume, so logins survive redeploys) |
+| `AH_MCP_TOKEN` | a long random secret; clients connect to `https://<domain>/mcp?token=<secret>` |
+| `AH_MCP_BASE_URL` | the generated Railway domain, e.g. `https://<service>.up.railway.app` |
+| `AH_CALLBACK_HOST` | a second public domain routed to port `9876` (custom domain with target port 9876) |
+| `RAILWAY_RUN_UID` | `0`, so the container can write to the volume |
+
+Run `ah_login`, open the returned link on the callback domain and log in to Albert Heijn. The login proxy only runs for up to five minutes.
