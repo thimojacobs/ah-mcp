@@ -319,14 +319,6 @@ func doAHPost(ctx context.Context, path string, body, result any) error {
 func rewriteOAuthResponse(resp *http.Response, localOrigin, targetHost string, onCode func(string)) error {
 	// Intercept server-side redirects to appie://
 	loc := resp.Header.Get("Location")
-	// Diagnostic logging: path, status and content type only. Never the query
-	// string, cookies or body, which can contain the auth code.
-	locScheme := ""
-	if i := strings.Index(loc, "://"); i > 0 {
-		locScheme = loc[:i]
-	}
-	fmt.Fprintf(os.Stderr, "[ah-mcp] proxy %s %s -> %d ct=%q location-scheme=%q\n",
-		resp.Request.Method, resp.Request.URL.Path, resp.StatusCode, resp.Header.Get("Content-Type"), locScheme)
 	if strings.HasPrefix(loc, "appie://") {
 		u, err := url.Parse(loc)
 		if err != nil {
@@ -384,7 +376,6 @@ func rewriteOAuthResponse(resp *http.Response, localOrigin, targetHost string, o
 	body = bytes.ReplaceAll(body, []byte("appie%3A%2F%2Flogin-exit"), []byte(url.QueryEscape(cb)))
 	body = bytes.ReplaceAll(body, []byte("appie%3a%2f%2flogin-exit"), []byte(url.QueryEscape(cb)))
 	body = bytes.ReplaceAll(body, []byte("https://"+targetHost), []byte(localOrigin))
-	logAppieContext(resp.Request.URL.Path, body)
 
 	resp.Body = io.NopCloser(bytes.NewReader(body))
 	resp.ContentLength = int64(len(body))
@@ -424,36 +415,6 @@ func readBody(resp *http.Response) ([]byte, error) {
 	return data, err
 }
 
-var longToken = regexp.MustCompile(`[A-Za-z0-9_\-\.]{20,}`)
-
-// logAppieContext logs a short window around each leftover "appie" in body
-// (ignoring the harmless client_id "appie-ios"), with long tokens masked so
-// auth codes never reach the logs.
-func logAppieContext(path string, body []byte) {
-	lower := bytes.ToLower(body)
-	logged := 0
-	for i := 0; logged < 3; {
-		j := bytes.Index(lower[i:], []byte("appie"))
-		if j < 0 {
-			return
-		}
-		pos := i + j
-		i = pos + 5
-		if bytes.HasPrefix(lower[pos:], []byte("appie-ios")) {
-			continue
-		}
-		lo, hi := pos-40, pos+80
-		if lo < 0 {
-			lo = 0
-		}
-		if hi > len(body) {
-			hi = len(body)
-		}
-		ctx := longToken.ReplaceAllString(string(body[lo:hi]), "***")
-		fmt.Fprintf(os.Stderr, "[ah-mcp] proxy %s: leftover appie context: %q\n", path, ctx)
-		logged++
-	}
-}
 
 
 
