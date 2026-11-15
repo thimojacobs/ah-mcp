@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"regexp"
 	"os"
 	"path/filepath"
 	"strings"
@@ -355,11 +356,17 @@ func rewriteOAuthResponse(resp *http.Response, localOrigin, targetHost string) e
 	if err != nil {
 		return err
 	}
-	body = bytes.ReplaceAll(body, []byte("appie://login-exit"), []byte(localOrigin+"/callback"))
+	cb := localOrigin + "/callback"
+	body = bytes.ReplaceAll(body, []byte("appie://login-exit"), []byte(cb))
+	// The Next.js post-login page can carry the redirect in escaped or
+	// URL-encoded form (JSON/JS strings, query parameters).
+	body = bytes.ReplaceAll(body, []byte(`appie:\/\/login-exit`), []byte(cb))
+	body = bytes.ReplaceAll(body, []byte(`appie:\u002F\u002Flogin-exit`), []byte(cb))
+	body = bytes.ReplaceAll(body, []byte(`appie:\u002f\u002flogin-exit`), []byte(cb))
+	body = bytes.ReplaceAll(body, []byte("appie%3A%2F%2Flogin-exit"), []byte(url.QueryEscape(cb)))
+	body = bytes.ReplaceAll(body, []byte("appie%3a%2f%2flogin-exit"), []byte(url.QueryEscape(cb)))
 	body = bytes.ReplaceAll(body, []byte("https://"+targetHost), []byte(localOrigin))
-	if bytes.Contains(bytes.ToLower(body), []byte("appie")) {
-		fmt.Fprintf(os.Stderr, "[ah-mcp] proxy %s: response body still mentions appie after rewrite\n", resp.Request.URL.Path)
-	}
+	logAppieContext(resp.Request.URL.Path, body)
 
 	resp.Body = io.NopCloser(bytes.NewReader(body))
 	resp.ContentLength = int64(len(body))
@@ -397,4 +404,35 @@ func readBody(resp *http.Response) ([]byte, error) {
 	data, err := io.ReadAll(reader)
 	resp.Body.Close()
 	return data, err
+}
+
+var longToken = regexp.MustCompile(`[A-Za-z0-9_\-\.]{20,}`)
+
+// logAppieContext logs a short window around each leftover "appie" in body
+// (ignoring the harmless client_id "appie-ios"), with long tokens masked so
+// auth codes never reach the logs.
+func logAppieContext(path string, body []byte) {
+	lower := bytes.ToLower(body)
+	logged := 0
+	for i := 0; logged < 3; {
+		j := bytes.Index(lower[i:], []byte("appie"))
+		if j < 0 {
+			return
+		}
+		pos := i + j
+		i = pos + 5
+		if bytes.HasPrefix(lower[pos:], []byte("appie-ios")) {
+			continue
+		}
+		lo, hi := pos-40, pos+80
+		if lo < 0 {
+			lo = 0
+		}
+		if hi > len(body) {
+			hi = len(body)
+		}
+		ctx := longToken.ReplaceAllString(string(body[lo:hi]), "***")
+		fmt.Fprintf(os.Stderr, "[ah-mcp] proxy %s: leftover appie context: %q\n", path, ctx)
+		logged++
+	}
 }
