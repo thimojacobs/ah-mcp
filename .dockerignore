@@ -1,0 +1,6 @@
+.git
+.env
+*.json
+!go.sum
+tokens.json
+ah-mcp
