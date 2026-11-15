@@ -310,6 +310,14 @@ func doAHPost(ctx context.Context, path string, body, result any) error {
 func rewriteOAuthResponse(resp *http.Response, localOrigin, targetHost string) error {
 	// Intercept server-side redirects to appie://
 	loc := resp.Header.Get("Location")
+	// Diagnostic logging: path, status and content type only. Never the query
+	// string, cookies or body, which can contain the auth code.
+	locScheme := ""
+	if i := strings.Index(loc, "://"); i > 0 {
+		locScheme = loc[:i]
+	}
+	fmt.Fprintf(os.Stderr, "[ah-mcp] proxy %s %s -> %d ct=%q location-scheme=%q\n",
+		resp.Request.Method, resp.Request.URL.Path, resp.StatusCode, resp.Header.Get("Content-Type"), locScheme)
 	if strings.HasPrefix(loc, "appie://") {
 		u, err := url.Parse(loc)
 		if err != nil {
@@ -349,6 +357,9 @@ func rewriteOAuthResponse(resp *http.Response, localOrigin, targetHost string) e
 	}
 	body = bytes.ReplaceAll(body, []byte("appie://login-exit"), []byte(localOrigin+"/callback"))
 	body = bytes.ReplaceAll(body, []byte("https://"+targetHost), []byte(localOrigin))
+	if bytes.Contains(bytes.ToLower(body), []byte("appie")) {
+		fmt.Fprintf(os.Stderr, "[ah-mcp] proxy %s: response body still mentions appie after rewrite\n", resp.Request.URL.Path)
+	}
 
 	resp.Body = io.NopCloser(bytes.NewReader(body))
 	resp.ContentLength = int64(len(body))
