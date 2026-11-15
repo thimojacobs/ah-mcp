@@ -12,7 +12,6 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"regexp"
-	"strconv"
 	"os"
 	"path/filepath"
 	"strings"
@@ -191,29 +190,20 @@ func StartOAuthFlow(ctx context.Context, callbackHost string, callbackPort int, 
 		io.WriteString(w, loginSuccessHTML)
 	})
 
+	onCode := func(code string) {
+		fmt.Fprintf(os.Stderr, "[ah-mcp] OAuth code captured by proxy (len=%d)\n", len(code))
+		select {
+		case codeCh <- code:
+		default:
+		}
+	}
+
 	proxy := &httputil.ReverseProxy{
 		Director: func(req *http.Request) {
 			req.URL.Scheme = target.Scheme
 			req.URL.Host = target.Host
 			req.Host = target.Host
 			req.Header.Del("Accept-Encoding")
-			// The browser carries redirect_uri=<callbackHost>/callback so that
-			// AH's client-side redirect lands on us. AH itself only accepts
-			// appie://login-exit, so map it back on every request we forward.
-			cb := callbackHost + "/callback"
-			req.URL.RawQuery = restoreAppieRedirect(req.URL.RawQuery, cb)
-			if ref := req.Header.Get("Referer"); ref != "" {
-				req.Header.Set("Referer", restoreAppieRedirect(ref, cb))
-			}
-			ct := req.Header.Get("Content-Type")
-			if req.Body != nil && (strings.Contains(ct, "json") || strings.Contains(ct, "x-www-form-urlencoded")) {
-				if raw, err := io.ReadAll(io.LimitReader(req.Body, 1<<20)); err == nil {
-					nb := []byte(restoreAppieRedirect(string(raw), cb))
-					req.Body = io.NopCloser(bytes.NewReader(nb))
-					req.ContentLength = int64(len(nb))
-					req.Header.Set("Content-Length", strconv.Itoa(len(nb)))
-				}
-			}
 			// Rewrite Origin and Referer so AH's API doesn't reject the request
 			// because it sees our proxy hostname instead of login.ah.nl.
 			if origin := req.Header.Get("Origin"); origin != "" {
@@ -224,7 +214,7 @@ func StartOAuthFlow(ctx context.Context, callbackHost string, callbackPort int, 
 			}
 		},
 		ModifyResponse: func(resp *http.Response) error {
-			return rewriteOAuthResponse(resp, callbackHost, target.Host)
+			return rewriteOAuthResponse(resp, callbackHost, target.Host, onCode)
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, proxyErr error) {
 			fmt.Fprintf(os.Stderr, "[ah-mcp] proxy error %s %s: %v\n", r.Method, r.URL.Path, proxyErr)
@@ -238,8 +228,8 @@ func StartOAuthFlow(ctx context.Context, callbackHost string, callbackPort int, 
 
 	// Build the login URL that the user must open (via our local proxy).
 	loginURL = fmt.Sprintf(
-		"%s/login?client_id=%s&response_type=code&redirect_uri=%s",
-		callbackHost, ahClientID, url.QueryEscape(callbackHost+"/callback"),
+		"%s/login?client_id=%s&response_type=code&redirect_uri=appie://login-exit",
+		callbackHost, ahClientID,
 	)
 
 	// Wait for the code, exchange it, save tokens — all in background.
@@ -326,7 +316,7 @@ func doAHPost(ctx context.Context, path string, body, result any) error {
 //   - strips security headers that block the proxy
 //   - sanitizes cookies for HTTP use on localhost
 //   - replaces appie:// and login.ah.nl URLs in HTML/JS/JSON bodies
-func rewriteOAuthResponse(resp *http.Response, localOrigin, targetHost string) error {
+func rewriteOAuthResponse(resp *http.Response, localOrigin, targetHost string, onCode func(string)) error {
 	// Intercept server-side redirects to appie://
 	loc := resp.Header.Get("Location")
 	// Diagnostic logging: path, status and content type only. Never the query
@@ -341,6 +331,9 @@ func rewriteOAuthResponse(resp *http.Response, localOrigin, targetHost string) e
 		u, err := url.Parse(loc)
 		if err != nil {
 			return fmt.Errorf("parse appie URL %q: %w", loc, err)
+		}
+		if c := u.Query().Get("code"); c != "" {
+			onCode(c)
 		}
 		resp.Header.Set("Location", fmt.Sprintf("%s/callback?%s", localOrigin, u.Query().Encode()))
 		return nil
@@ -374,7 +367,13 @@ func rewriteOAuthResponse(resp *http.Response, localOrigin, targetHost string) e
 	if err != nil {
 		return err
 	}
-	logPostLoginBody(resp, body)
+	// AH's Next.js post-login page hands out the auth code as a client-side
+	// redirect inside ingelogd.json. The browser may prefetch (and discard)
+	// that response, so capture the code here instead of relying on the
+	// browser following the redirect to /callback.
+	if m := appieCodeRe.FindSubmatch(body); m != nil {
+		onCode(string(m[1]))
+	}
 	cb := localOrigin + "/callback"
 	body = bytes.ReplaceAll(body, []byte("appie://login-exit"), []byte(cb))
 	// The Next.js post-login page can carry the redirect in escaped or
@@ -456,37 +455,6 @@ func logAppieContext(path string, body []byte) {
 	}
 }
 
-// restoreAppieRedirect maps our callback URL (plain, JSON-escaped or
-// URL-encoded) back to the appie://login-exit redirect AH expects.
-func restoreAppieRedirect(in, cb string) string {
-	const appie = "appie://login-exit"
-	r := strings.NewReplacer(
-		cb, appie,
-		strings.ReplaceAll(cb, "/", `\/`), appie,
-		url.QueryEscape(cb), url.QueryEscape(appie),
-	)
-	return r.Replace(in)
-}
 
-var codeParam = regexp.MustCompile(`code(=|%3D|":")[^&"\\]+`)
 
-// logPostLoginBody logs a masked prefix of the post-login API responses and
-// the names (never values) of any cookies they set, to see how AH hands the
-// auth code to the browser. Long tokens and code= values are masked.
-func logPostLoginBody(resp *http.Response, body []byte) {
-	path := resp.Request.URL.Path
-	if !strings.HasPrefix(path, "/login/api/login") && !strings.Contains(path, "ingelogd") {
-		return
-	}
-	n := len(body)
-	if n > 700 {
-		n = 700
-	}
-	m := codeParam.ReplaceAllString(string(body[:n]), "code=***")
-	m = longToken.ReplaceAllString(m, "***")
-	var names []string
-	for _, c := range resp.Header.Values("Set-Cookie") {
-		names = append(names, strings.SplitN(c, "=", 2)[0])
-	}
-	fmt.Fprintf(os.Stderr, "[ah-mcp] proxy %s: body(masked, %d bytes)=%q set-cookie-names=%v\n", path, len(body), m, names)
-}
+var appieCodeRe = regexp.MustCompile(`appie://login-exit\?code=([A-Za-z0-9._~%\-]+)`)
